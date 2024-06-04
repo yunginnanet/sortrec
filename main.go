@@ -197,7 +197,12 @@ func getRawExif(imagePath string) ([]byte, error) {
 
 	rawExif, err := exif.SearchAndExtractExifWithReader(io.LimitReader(buf, n))
 	bufs.Put(buf)
-	fmt.Printf("Got %d bytes of exif data\n", len(rawExif))
+	if len(rawExif) != 0 {
+		fmt.Printf("Got %d bytes of exif data\n", len(rawExif))
+	}
+	if len(rawExif) == 0 && err == nil {
+		err = fmt.Errorf("no exif data found")
+	}
 	return rawExif, err
 }
 
@@ -226,6 +231,8 @@ func postprocessImage(imagePath string, wg *sync.WaitGroup, imagesChan chan<- Im
 }
 
 func createPath(newPath string) {
+	newPath = strings.TrimPrefix(newPath, ".")
+	newPath = filepath.Clean(newPath)
 	if newPath == "" {
 		return
 	}
@@ -465,6 +472,7 @@ func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
 					if fileInfo, err := file.Info(); err == nil && fileInfo.Mode().IsRegular() {
 						src := filepath.Join(path, filepath.Base(file.Name()))
 						dst := strconv.Itoa((fileCounterr-1)/maxNumberOfFilesPerFolder + 1)
+						fmt.Println("Moving " + src + " to " + filepath.Join(path, dst, filepath.Base(src)))
 						os.Rename(src, filepath.Join(path, dst, filepath.Base(src)))
 						fileCounterr++
 					}
@@ -569,6 +577,9 @@ func processFile(paths chan string, wg *sync.WaitGroup) {
 	var path string
 	select {
 	case path = <-paths:
+		if path == "" {
+			return
+		}
 	default:
 		return
 	}
@@ -585,7 +596,7 @@ func processFile(paths chan string, wg *sync.WaitGroup) {
 	createPath(destinationDirectory)
 
 	fname := filepath.Base(path)
-	fileName := getFileName(fname, path, extension, isImage)
+	fileName := filepath.Base(getFileName(fname, path, extension, isImage))
 
 	destinationFile := filepath.Join(destinationDirectory, fileName)
 	_, _ = os.Stdout.WriteString(fmt.Sprintf("symlinking %s to %s\n", path, destinationFile))
@@ -597,7 +608,7 @@ var fastMode bool
 func getDestinationDirectory(path string) (ext, dest string, isImage bool) {
 	// so we can skip exif data for non-media files
 	// and use this for data recovery that doesn't append the correct extension
-	ext = strings.ToUpper(filepath.Ext(filepath.Base(path)))
+	ext = strings.TrimPrefix(strings.ToUpper(filepath.Ext(filepath.Base(path))), ".")
 	if fastMode && ext != "" {
 		return ext, filepath.Join(*destination, ext), false
 	}
@@ -641,10 +652,8 @@ func getDestinationDirectory(path string) (ext, dest string, isImage bool) {
 }
 
 func getFileName(fname string, sourcePath, extension string, isImage bool) string {
-	if keepFilename || fastMode || !isImage || !dateTimeFilename {
-		if filepath.Base(fname) != "" {
-			return filepath.Base(fname) + "." + strings.ToLower(extension)
-		}
+	if (keepFilename || fastMode || !isImage || !dateTimeFilename) && fname != "" {
+		return fname
 	}
 
 	fmt.Println("getting filename for: " + sourcePath)
@@ -652,7 +661,17 @@ func getFileName(fname string, sourcePath, extension string, isImage bool) strin
 	if dateTimeFilename && !fastMode && !keepFilename && isImage {
 		return getDateTimeFileName(sourcePath, extension, fname)
 	}
-	return strconv.Itoa(int(atomic.LoadInt64(&fileCounter))) + "." + strings.ToLower(extension)
+
+	if fname == "" {
+		fstat, err := os.Stat(sourcePath)
+		if err == nil {
+			fname = fstat.ModTime().Format("2006-01-02_15-04-05")
+		} else {
+			fname = "unknown"
+		}
+		fname = fname + "." + strings.ToLower(extension)
+	}
+	return fname
 }
 
 func getDateTimeFileName(sourcePath, extension, fallbackName string) string {
