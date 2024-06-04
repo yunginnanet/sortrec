@@ -527,9 +527,9 @@ func main() {
 		fmt.Println("I will rename your files like '1.jpg'")
 	}
 
-	fileNumber := getNumberOfFilesInFolderRecursively(source)
-	totalAmountToCopy := strconv.Itoa(fileNumber)
-	fmt.Println("Files to copy: " + totalAmountToCopy)
+	/*	fileNumber := getNumberOfFilesInFolderRecursively(source)
+		totalAmountToCopy := strconv.Itoa(fileNumber)
+		fmt.Println("Files to copy: " + totalAmountToCopy)*/
 
 	var wg = &sync.WaitGroup{}
 
