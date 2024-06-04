@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"git.tcp.direct/kayos/common/entropy"
 	"git.tcp.direct/kayos/common/pool"
 	"github.com/briandowns/spinner"
 	"github.com/dsoprea/go-exif/v3"
@@ -41,54 +42,59 @@ var (
 	dateTimeFilename          bool
 	minEventDeltaDays         int
 	fileCounter               int64
-	fileBusy                  = make(map[string]*sync.Mutex)
-	busyLock                  sync.RWMutex
+	fileBusy                  = make(map[string]*int64)
+	busyIndexLock             sync.RWMutex
+)
+
+type lock int64
+
+const (
+	unlocked lock = 0
+	locked   lock = 1
 )
 
 func fileIsBusy(path string) bool {
-	busyLock.RLock()
+	busyIndexLock.RLock()
 	flock, ok := fileBusy[path]
+	busyIndexLock.RUnlock()
 	if !ok {
-		busyLock.RUnlock()
 		return false
 	}
-	if !flock.TryLock() {
-		busyLock.RUnlock()
-		return true
-	}
-	flock.Unlock()
-	busyLock.RUnlock()
-	return false
+	return atomic.CompareAndSwapInt64(flock, int64(locked), int64(locked))
 }
 
 func lockFile(path string) {
-	busyLock.RLock()
-	if flock, ok := fileBusy[path]; ok {
-		busyLock.RUnlock()
-		flock.Lock()
+	busyIndexLock.RLock()
+	flock, ok := fileBusy[path]
+	busyIndexLock.RUnlock()
+	if !ok {
+		busyIndexLock.Lock()
+		fileBusy[path] = new(int64)
+		flock = fileBusy[path]
+		atomic.StoreInt64(flock, int64(locked))
+		busyIndexLock.Unlock()
 		return
 	}
-	busyLock.RUnlock()
-	busyLock.Lock()
-	mu := &sync.Mutex{}
-	mu.Lock()
-	fileBusy[path] = mu
-	busyLock.Unlock()
+	// exponential back off on the spinlocc
+	multiplier := 0
+	for !atomic.CompareAndSwapInt64(flock, int64(unlocked), int64(locked)) {
+		multiplier++
+		target := 100
+		if multiplier > 10 {
+			target = target * multiplier / 10
+		}
+		entropy.RandSleepMS(target)
+	}
 }
 
 func unlockFile(path string) {
-	busyLock.RLock()
+	busyIndexLock.RLock()
 	flock, ok := fileBusy[path]
+	busyIndexLock.RUnlock()
 	if !ok {
-		busyLock.RUnlock()
 		return
 	}
-	busyLock.RUnlock()
-	if flock.TryLock() {
-		flock.Unlock()
-		return
-	}
-	flock.Unlock()
+	atomic.StoreInt64(flock, int64(unlocked))
 }
 
 const (
@@ -239,7 +245,7 @@ func createPath(newPath string) {
 	lockFile(newPath)
 	defer unlockFile(newPath)
 	if _, err := os.Stat(newPath); os.IsNotExist(err) {
-		if err := os.MkdirAll(newPath, os.ModePerm); err != nil {
+		if err := os.MkdirAll(newPath, 0755); err != nil {
 			panic(fmt.Errorf("%s: %w", newPath, err))
 		}
 	}
@@ -419,6 +425,7 @@ func symLink(src, dst string) {
 		unlockFile(src)
 		unlockFile(dst)
 	}()
+
 	if err := os.Symlink(src, dst); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			if err = os.Remove(dst); err != nil {
@@ -442,6 +449,21 @@ func symLink(src, dst string) {
 		} else {
 			_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not create symlink %s"+reset+": %v\n", dst, err))
 		}
+
+		oldErr := err
+		if _, err = os.Stat(filepath.Dir(dst)); err != nil {
+			fmt.Println("Creating directory " + filepath.Dir(dst))
+			if err = os.MkdirAll(filepath.Dir(dst), 0755); err == nil || errors.Is(err, os.ErrExist) {
+				if err = os.Symlink(src, dst); err == nil {
+					return
+				}
+			}
+		}
+
+		if err = oldErr; err == nil {
+			return
+		}
+
 		atomic.AddInt64(&errCt, 1)
 		if atomic.LoadInt64(&errCt) > 50 {
 			fmt.Println("\n\n" + red + "Last error: " + err.Error() + reset)
@@ -743,7 +765,11 @@ func getFileName(fname string, sourcePath, extension string, isImage, isWAV bool
 	index := 0
 	for fileExists(filepath.Join(*destination, extension, fname)) {
 		index++
-		fname = strings.TrimSuffix(fname, filepath.Ext(fname)) + "_" + strconv.Itoa(index) + filepath.Ext(fname)
+		fbase := strings.TrimSuffix(fname, filepath.Ext(fname))
+		if strings.Contains(fbase, "_") {
+			fbase = strings.Split(fbase, "_")[0]
+		}
+		fname = fmt.Sprintf("%s_%d.%s", fbase, index, filepath.Ext(fname))
 	}
 
 	return fname
