@@ -160,7 +160,7 @@ var bufs = pool.NewBufferFactory()
 const kilo = 1024 * 1024
 
 func getRawExif(imagePath string) ([]byte, error) {
-	fmt.Println("Getting raw exif for " + imagePath)
+	// fmt.Println("Getting raw exif for " + imagePath)
 	/*	lockFile(imagePath)
 		defer unlockFile(imagePath)*/
 
@@ -521,7 +521,7 @@ func main() {
 	}
 
 	fmt.Printf("Reading from source '%s', writing to destination '%s' (max %d files per directory, splitting by year %v).\n",
-		source, destination, maxNumberOfFilesPerFolder, splitMonths)
+		source, *destination, maxNumberOfFilesPerFolder, splitMonths)
 
 	if keepFilename {
 		fmt.Println("I will keep your filenames as they are")
