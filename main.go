@@ -18,6 +18,7 @@ import (
 	"github.com/briandowns/spinner"
 	"github.com/dsoprea/go-exif/v3"
 	exifcommon "github.com/dsoprea/go-exif/v3/common"
+	"github.com/go-audio/wav"
 	"github.com/h2non/filetype"
 	"github.com/panjf2000/ants/v2"
 )
@@ -197,9 +198,6 @@ func getRawExif(imagePath string) ([]byte, error) {
 
 	rawExif, err := exif.SearchAndExtractExifWithReader(io.LimitReader(buf, n))
 	bufs.Put(buf)
-	if len(rawExif) != 0 {
-		fmt.Printf("Got %d bytes of exif data\n", len(rawExif))
-	}
 	if len(rawExif) == 0 && err == nil {
 		err = fmt.Errorf("no exif data found")
 	}
@@ -212,7 +210,7 @@ func postprocessImage(imagePath string, wg *sync.WaitGroup, imagesChan chan<- Im
 	rawExif, err := getRawExif(imagePath)
 
 	if err != nil {
-		_, _ = os.Stdout.WriteString(fmt.Sprintf("Invalid EXIF data for %s: %s\n", imagePath, err.Error()))
+		// _, _ = os.Stdout.WriteString(fmt.Sprintf("Invalid EXIF data for %s: %s\n", imagePath, err.Error()))
 		return
 	}
 
@@ -225,6 +223,8 @@ func postprocessImage(imagePath string, wg *sync.WaitGroup, imagesChan chan<- Im
 		}
 		creationT := fileInfo.ModTime()
 		creationTime = &creationT
+	} else {
+		fmt.Printf("Creation time found for %s: %s", imagePath, creationTime.Format(time.RFC3339))
 	}
 
 	imagesChan <- Image{creationTime.Unix(), imagePath}
@@ -444,6 +444,7 @@ func symLink(src, dst string) {
 		}
 		atomic.AddInt64(&errCt, 1)
 		if atomic.LoadInt64(&errCt) > 50 {
+			fmt.Println("\n\n" + red + "Last error: " + err.Error() + reset)
 			fmt.Println("\n\n" + red + "Too many errors, exiting\n\n" + reset)
 			os.Exit(1)
 		}
@@ -587,16 +588,19 @@ func processFile(paths chan string, wg *sync.WaitGroup) {
 
 	// fmt.Println("extension for: " + path + " is " + extension)
 
-	extension, destinationDirectory, isImage := getDestinationDirectory(path)
+	extension, destinationDirectory, isImage, isWAV := getDestinationDirectory(path)
+	/*if isImage || isWAV {
+		fmt.Printf("detected: wav=%t image=%t\n", isWAV, isImage)
+	}*/
 	if !strings.Contains(destinationDirectory, *destination) {
 		panic(fmt.Errorf("destination directory %s is not a subdirectory of %s", destinationDirectory, *destination))
 		os.Exit(1)
 	}
-	fmt.Println("destination directory: " + destinationDirectory)
+	// fmt.Println("destination directory: " + destinationDirectory)
 	createPath(destinationDirectory)
 
 	fname := filepath.Base(path)
-	fileName := filepath.Base(getFileName(fname, path, extension, isImage))
+	fileName := getFileName(fname, path, extension, isImage, isWAV)
 
 	destinationFile := filepath.Join(destinationDirectory, fileName)
 	_, _ = os.Stdout.WriteString(fmt.Sprintf("symlinking %s to %s\n", path, destinationFile))
@@ -605,16 +609,16 @@ func processFile(paths chan string, wg *sync.WaitGroup) {
 
 var fastMode bool
 
-func getDestinationDirectory(path string) (ext, dest string, isImage bool) {
+func getDestinationDirectory(path string) (ext, dest string, isImage, isWAV bool) {
 	// so we can skip exif data for non-media files
 	// and use this for data recovery that doesn't append the correct extension
 	ext = strings.TrimPrefix(strings.ToUpper(filepath.Ext(filepath.Base(path))), ".")
 	if fastMode && ext != "" {
-		return ext, filepath.Join(*destination, ext), false
+		return ext, filepath.Join(*destination, ext), ext == "JPG" || ext == "JPEG", ext == "WAV"
 	}
 
 	if fastMode && ext == "" {
-		return "UNKNOWN", filepath.Join(*destination, "UNKNOWN"), false
+		return "UNKNOWN", filepath.Join(*destination, "UNKNOWN"), false, false
 	}
 
 	b := magicBufs.Get().([]byte)
@@ -626,7 +630,7 @@ func getDestinationDirectory(path string) (ext, dest string, isImage bool) {
 		if ext == "" {
 			ext = "UNKNOWN"
 		}
-		return ext, filepath.Join(*destination, ext), false
+		return ext, filepath.Join(*destination, ext), ext == "JPG" || ext == "JPEG", ext == "WAV"
 	}
 
 	n, rerr := f.Read(b)
@@ -637,6 +641,7 @@ func getDestinationDirectory(path string) (ext, dest string, isImage bool) {
 			if kind != filetype.Unknown {
 				fmt.Printf("File type: %s. MIME: %s\n", kind.Extension, kind.MIME.Value)
 				ext = strings.ToUpper(kind.Extension)
+				isWAV = kind.MIME.Subtype == "x-wav" || ext == "WAV"
 			}
 		}
 	}
@@ -648,18 +653,81 @@ func getDestinationDirectory(path string) (ext, dest string, isImage bool) {
 	dest = filepath.Join(*destination, ext)
 	isImage = filetype.IsImage(b)
 	magicBufs.Put(b)
-	return
+	return ext, dest, isImage || ext == "JPG" || ext == "JPEG", isWAV || ext == "WAV"
 }
 
-func getFileName(fname string, sourcePath, extension string, isImage bool) string {
-	if (keepFilename || fastMode || !isImage || !dateTimeFilename) && fname != "" {
+func readWAV(path string) (string, error) {
+	_, ogFilename := filepath.Split(path)
+
+	f, err := os.Open(path)
+	if err != nil {
+		return ogFilename, fmt.Errorf("couldn't open %s: %s", path, err.Error())
+	}
+	defer f.Close()
+
+	decoder := wav.NewDecoder(f)
+
+	decoder.ReadMetadata()
+	if decoder.Err() != nil {
+		return ogFilename, decoder.Err()
+	}
+
+	if decoder.Metadata == nil {
+		return ogFilename, nil
+	}
+
+	var newFilename string
+
+	if decoder.Metadata.Title != "" {
+		newFilename = decoder.Metadata.Title
+	}
+
+	if decoder.Metadata.Artist != "" {
+		if newFilename != "" {
+			newFilename = decoder.Metadata.Artist + " - " + newFilename
+		} else {
+			newFilename = decoder.Metadata.Artist + " - " + ogFilename
+		}
+	}
+
+	if decoder.Metadata.Software != "" {
+		if newFilename == "" {
+			newFilename = filepath.Join(decoder.Metadata.Software, ogFilename)
+		} else {
+			newFilename = filepath.Join(decoder.Metadata.Software, newFilename)
+		}
+	}
+
+	if newFilename == "" {
+		err = fmt.Errorf("no metadata found")
+	} else {
+		fmt.Printf("got WAV metadata for %s: %s\n", path, newFilename)
+	}
+
+	return newFilename, err
+}
+
+func getFileName(fname string, sourcePath, extension string, isImage, isWAV bool) string {
+	fname = filepath.Base(fname)
+	if (keepFilename || fastMode || (!isImage && !isWAV) || !dateTimeFilename) && fname != "" {
 		return fname
 	}
 
 	fmt.Println("getting filename for: " + sourcePath)
 
 	if dateTimeFilename && !fastMode && !keepFilename && isImage {
-		return getDateTimeFileName(sourcePath, extension, fname)
+		fname = getDateTimeFileName(sourcePath, extension, fname)
+	}
+
+	if dateTimeFilename && !fastMode && !keepFilename && isWAV && !isImage {
+		newFilename, err := readWAV(sourcePath)
+		if err == nil {
+			fname = newFilename
+		}
+	}
+
+	if !isImage && !isWAV {
+		return fname
 	}
 
 	if fname == "" {
@@ -671,6 +739,13 @@ func getFileName(fname string, sourcePath, extension string, isImage bool) strin
 		}
 		fname = fname + "." + strings.ToLower(extension)
 	}
+
+	index := 0
+	for fileExists(filepath.Join(*destination, extension, fname)) {
+		index++
+		fname = strings.TrimSuffix(fname, filepath.Ext(fname)) + "_" + strconv.Itoa(index) + filepath.Ext(fname)
+	}
+
 	return fname
 }
 
@@ -681,11 +756,7 @@ func getDateTimeFileName(sourcePath, extension, fallbackName string) string {
 		if creationTime != nil && err == nil {
 			creationTimeStr := creationTime.Format("2006-01-02_15-04-05")
 			fileName := creationTimeStr + "." + strings.ToLower(extension)
-			index := 0
-			for fileExists(filepath.Join(*destination, extension, fileName)) {
-				index++
-				fileName = fmt.Sprintf("%s-%d.%s", creationTimeStr, index, strings.ToLower(extension))
-			}
+
 			return fileName
 		}
 	}
