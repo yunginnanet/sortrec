@@ -35,7 +35,7 @@ var (
 	maxNumberOfFilesPerFolder int
 	splitMonths               bool
 	source                    string
-	destination               string
+	destination               = new(string)
 	keepFilename              bool
 	dateTimeFilename          bool
 	minEventDeltaDays         int
@@ -100,6 +100,8 @@ func getMinimumCreationTime(rawExif []byte) (*time.Time, error) {
 		creationTime *time.Time
 	)
 
+	fmt.Println("Getting minimum creation time")
+
 	im, err := exifcommon.NewIfdMappingWithStandard()
 	if err != nil {
 		_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not create IFD mapping: "+reset+"%v\n", err))
@@ -109,9 +111,6 @@ func getMinimumCreationTime(rawExif []byte) (*time.Time, error) {
 	ti := exif.NewTagIndex()
 
 	visitor := func(ite *exif.IfdTagEntry) (err error) {
-		if creationTime != nil {
-			return nil
-		}
 		defer func() {
 			if state := recover(); state != nil {
 				_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"panic recovered, state: "+reset+"%v\n", state))
@@ -130,7 +129,9 @@ func getMinimumCreationTime(rawExif []byte) (*time.Time, error) {
 					if t.IsZero() {
 						return nil
 					}
-					creationTime = &t
+					if creationTime == nil || t.Before(*creationTime) {
+						creationTime = &t
+					}
 				}
 			}
 		default:
@@ -147,54 +148,57 @@ func getMinimumCreationTime(rawExif []byte) (*time.Time, error) {
 		err = fmt.Errorf("no creation time found")
 	}
 
+	if creationTime != nil {
+		fmt.Println("Minimum creation time: " + creationTime.Format(time.RFC3339))
+	}
 	return creationTime, err
 }
 
 var bufs = pool.NewBufferFactory()
 
+const kilo = 1024 * 1024
+
 func getRawExif(imagePath string) ([]byte, error) {
+	fmt.Println("Getting raw exif for " + imagePath)
 	lockFile(imagePath)
 	defer unlockFile(imagePath)
 
+	buf := bufs.Get()
+	buf.Reset()
+	// 64KB
+	buf.Grow(kilo * 64)
+
 	f, err := os.Open(imagePath)
 	if err != nil {
-		// _, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not open image %s: "+reset+"%v\n", imagePath, err))
+		// _, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not open file %s: "+reset+"%v\n", imagePath, err))
+		return nil, err
+	}
+	size := kilo
+	fstat, statErr := f.Stat()
+	if statErr == nil && fstat.Size() < int64(kilo) {
+		size = int(fstat.Size() / 2)
+	}
+	lr := io.LimitReader(f, int64(size))
+	buf2 := bufs.Get()
+	buf2.Reset()
+	buf2.Grow(size / 2)
+	var n int64
+	n, err = io.CopyBuffer(buf, lr, buf2.Bytes()[0:buf2.Cap()])
+	f.Close()
+	bufs.Put(buf2)
+
+	if err != nil || n == 0 {
+		if err == nil {
+			err = fmt.Errorf("no data read")
+		}
+		// _, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not read file %s: "+reset+"%v\n", imagePath, err))
 		return nil, err
 	}
 
-	b := bufs.Get()
-	b.Reset()
-	_ = b.Grow(1024 * 1024)
-	pr, pw := io.Pipe()
-	doneChan := make(chan struct{})
-
-	go func() {
-		defer close(doneChan)
-
-		n, e := io.CopyBuffer(pw, f, b.Bytes()[:b.Cap()])
-		if e != nil {
-			_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not read image %s: "+reset+"%v\n", imagePath, e))
-			return
-		}
-		if n == 0 {
-			_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"empty image %s"+reset+"\n", imagePath))
-			return
-		}
-		_ = pw.Close()
-	}()
-
-	go func() {
-		<-doneChan
-		bufs.MustPut(b)
-		_ = f.Close()
-	}()
-
-	rawExif, err := exif.SearchAndExtractExifWithReader(pr)
-	if err != nil {
-		// _, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not extract exif data for %s: "+reset+"%v\n", imagePath, err))
-		return nil, err
-	}
-	return rawExif, nil
+	rawExif, err := exif.SearchAndExtractExifWithReader(io.LimitReader(buf, n))
+	bufs.Put(buf)
+	fmt.Printf("Got %d bytes of exif data\n", len(rawExif))
+	return rawExif, err
 }
 
 func postprocessImage(imagePath string, wg *sync.WaitGroup, imagesChan chan<- Image) {
@@ -222,9 +226,14 @@ func postprocessImage(imagePath string, wg *sync.WaitGroup, imagesChan chan<- Im
 }
 
 func createPath(newPath string) {
+	if newPath == "" {
+		return
+	}
+	lockFile(newPath)
+	defer unlockFile(newPath)
 	if _, err := os.Stat(newPath); os.IsNotExist(err) {
 		if err := os.MkdirAll(newPath, os.ModePerm); err != nil {
-			panic(err)
+			panic(fmt.Errorf("%s: %w", newPath, err))
 		}
 	}
 }
@@ -305,44 +314,35 @@ func writeImages(images []Image, destinationRoot string, minEventDeltaDays int, 
 }
 
 func postprocessImages(imageDirectory string, minEventDeltaDays int, splitByMonth bool) {
-	var wg sync.WaitGroup
-	imagesChan := make(chan Image)
+	var wg = &sync.WaitGroup{}
+	imagesChan := make(chan Image, 50)
 
-	spinner := spinner.New(spinner.CharSets[34], 50*time.Millisecond)
+	spin := spinner.New(spinner.CharSets[34], 50*time.Millisecond)
 
-	spinner.Start()
+	spin.Start()
 
-	go func() {
-		wg.Wait()
-		close(imagesChan)
-		spinner.Stop()
-	}()
-
-	err := filepath.Walk(imageDirectory, func(root string, info os.FileInfo, err error) error {
+	err := filepath.Walk(imageDirectory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
-			fdir, fname := filepath.Split(root)
-			if fname != info.Name() {
-				fname = filepath.Join(root, info.Name())
-				if strings.Count(fdir, info.Name()) > 1 {
-					fname = root
-				}
-			}
-			if fileIsBusy(fname) {
-				_, _ = os.Stdout.WriteString(fmt.Sprintf("File %s is busy, skipping\n", fname))
-				return nil
-			}
 			wg.Add(1)
-			_ = workers.Submit(func() { postprocessImage(fname, &wg, imagesChan) })
+			_ = workers.Submit(func() { postprocessImage(path, wg, imagesChan) })
 		}
 		return nil
 	})
+
 	if err != nil {
 		_, _ = os.Stdout.WriteString(fmt.Sprintf("Error walking the path %s: %v\n", imageDirectory, err))
+		spin.Stop()
 		return
 	}
+
+	go func() {
+		wg.Wait()
+		close(imagesChan)
+		spin.Stop()
+	}()
 
 	var images []Image
 	for image := range imagesChan {
@@ -437,38 +437,36 @@ func symLink(src, dst string) {
 		}
 		atomic.AddInt64(&errCt, 1)
 		if atomic.LoadInt64(&errCt) > 50 {
-			fmt.Println("Too many errors, exiting")
+			fmt.Println("\n\n" + red + "Too many errors, exiting\n\n" + reset)
 			os.Exit(1)
 		}
 	}
 }
 
 func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
-	filepath.Walk(folder, func(root string, info os.FileInfo, err error) error {
+	filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			dirPath := filepath.Join(root, info.Name())
-			filesInFolder, err := os.ReadDir(dirPath)
+			filesInFolder, err := os.ReadDir(path)
 			if err != nil {
-				_, _ = os.Stdout.WriteString(fmt.Sprintf("Could not read directory %s: %v\n", dirPath, err))
+				_, _ = os.Stdout.WriteString(fmt.Sprintf("%sCould not read directory %s%s: %v\n", red, path, err, reset))
 				return nil
 			}
 			if len(filesInFolder) > maxNumberOfFilesPerFolder {
 				numberOfSubfolders := (len(filesInFolder)-1)/maxNumberOfFilesPerFolder + 1
 				for subFolderNumber := 1; subFolderNumber <= numberOfSubfolders; subFolderNumber++ {
-					subFolderPath := filepath.Join(dirPath, strconv.Itoa(subFolderNumber))
+					subFolderPath := filepath.Join(path, strconv.Itoa(subFolderNumber))
 					createPath(subFolderPath)
 				}
-				fileCounter := 1
+				fileCounterr := 1
 				for _, file := range filesInFolder {
-					source := filepath.Join(dirPath, file.Name())
 					if fileInfo, err := file.Info(); err == nil && fileInfo.Mode().IsRegular() {
-						destDir := strconv.Itoa((fileCounter-1)/maxNumberOfFilesPerFolder + 1)
-						destination := filepath.Join(dirPath, destDir, file.Name())
-						os.Rename(source, destination)
-						fileCounter++
+						src := filepath.Join(path, filepath.Base(file.Name()))
+						dst := strconv.Itoa((fileCounterr-1)/maxNumberOfFilesPerFolder + 1)
+						os.Rename(src, filepath.Join(path, dst, filepath.Base(src)))
+						fileCounterr++
 					}
 				}
 			}
@@ -479,28 +477,28 @@ func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
 
 func main() {
 	var (
-		workersFlags int
-		poolsFlags   int
+		workersFlag int
+		poolsFlag   int
 	)
 
 	flag.StringVar(&source, "src", "", "Source directory with files recovered by Photorec")
-	flag.StringVar(&destination, "dest", "", "Destination directory to write sorted files to")
+	flag.StringVar(destination, "dest", "", "Destination directory to write sorted files to")
 	flag.IntVar(&maxNumberOfFilesPerFolder, "max-per-dir", 500, "Maximum number of files per directory")
 	flag.BoolVar(&splitMonths, "split-months", false, "Split JPEG files not only by year but by month as well")
 	flag.BoolVar(&keepFilename, "keep_filename", false, "Keeps the original filenames when copying")
 	flag.IntVar(&minEventDeltaDays, "min-event-delta", 4, "Minimum delta in days between two events")
 	flag.BoolVar(&dateTimeFilename, "date_time_filename", false, "Sets the filename to the exif date and time if possible")
-	flag.IntVar(&workersFlags, "workers", 5, "Number of workers to use")
-	flag.IntVar(&poolsFlags, "pools", 25, "Number of pools to use")
+	flag.IntVar(&workersFlag, "workers", 5, "Number of workers to use")
+	flag.IntVar(&poolsFlag, "pools", 25, "Number of pools to use")
 
 	flag.Parse()
 
-	if workersFlags > 0 && poolsFlags > 0 {
-		workers, _ = ants.NewMultiPool(workersFlags, poolsFlags, ants.RoundRobin)
+	if workersFlag > 0 && poolsFlag > 0 {
+		workers, _ = ants.NewMultiPool(workersFlag, poolsFlag, ants.RoundRobin)
 
 	}
 
-	if source == "" || destination == "" {
+	if source == "" || *destination == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -533,26 +531,31 @@ func main() {
 
 	spin.Start()
 
-	filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+	paths := make(chan string, poolsFlag*workersFlag)
+
+	if err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
 			wg.Add(1)
-			_ = workers.Submit(func() { processFile(path, wg) })
+			paths <- path
+			_ = workers.Submit(func() { processFile(paths, wg) })
 		}
 		return nil
-	})
-
-	wg.Wait()
+	}); err == nil {
+		wg.Wait()
+	} else {
+		fmt.Println(red + "Error walking the path " + source + ": " + err.Error() + reset)
+	}
 
 	spin.Stop()
 
 	log("start special file treatment")
-	postprocessImages(filepath.Join(destination, "JPG"), minEventDeltaDays, splitMonths)
+	postprocessImages(filepath.Join(*destination, "JPG"), minEventDeltaDays, splitMonths)
 
 	log("assure max file per folder number")
-	limitFilesPerFolder(destination, maxNumberOfFilesPerFolder)
+	limitFilesPerFolder(*destination, maxNumberOfFilesPerFolder)
 }
 
 var magicBufs = sync.Pool{
@@ -561,67 +564,92 @@ var magicBufs = sync.Pool{
 	},
 }
 
-var (
-	mediaFiles = make([]string, 0)
-	mediaLock  = sync.Mutex{}
-)
-
-func processFile(path string, wg *sync.WaitGroup) {
-	fmt.Println("processing: " + path)
-
+func processFile(paths chan string, wg *sync.WaitGroup) {
 	defer wg.Done()
-
-	var destinationDirectory string
-	var extension = strings.TrimPrefix(filepath.Ext(filepath.Base(path)), ".")
-
-	f, err := os.Open(path)
-	if err == nil {
-		b := magicBufs.Get().([]byte)
-		b = b[:0]
-		b = b[:261]
-		n, rerr := f.Read(b)
-		_ = f.Close()
-		if rerr == nil && n > 0 {
-			kind, kerr := filetype.Match(b)
-			if kerr == nil {
-				if kind != filetype.Unknown {
-					extension = kind.Extension
-				}
-				if kind.MIME.Type == "image" || kind.MIME.Type == "video" {
-					mediaLock.Lock()
-					mediaFiles = append(mediaFiles, path)
-					mediaLock.Unlock()
-				}
-			}
-		}
-		magicBufs.Put(b)
+	var path string
+	select {
+	case path = <-paths:
+	default:
+		return
 	}
+	fmt.Println("processing: " + path)
 
 	// fmt.Println("extension for: " + path + " is " + extension)
 
-	destinationDirectory = getDestinationDirectory(extension)
+	extension, destinationDirectory, isImage := getDestinationDirectory(path)
+	if !strings.Contains(destinationDirectory, *destination) {
+		panic(fmt.Errorf("destination directory %s is not a subdirectory of %s", destinationDirectory, *destination))
+		os.Exit(1)
+	}
+	fmt.Println("destination directory: " + destinationDirectory)
 	createPath(destinationDirectory)
 
 	fname := filepath.Base(path)
-	fileName := getFileName(fname, path, extension)
+	fileName := getFileName(fname, path, extension, isImage)
 
 	destinationFile := filepath.Join(destinationDirectory, fileName)
 	_, _ = os.Stdout.WriteString(fmt.Sprintf("symlinking %s to %s\n", path, destinationFile))
 	symLink(path, destinationFile)
 }
 
-func getDestinationDirectory(extension string) string {
-	if extension != "" {
-		return filepath.Join(destination, extension)
+var fastMode bool
+
+func getDestinationDirectory(path string) (ext, dest string, isImage bool) {
+	// so we can skip exif data for non-media files
+	// and use this for data recovery that doesn't append the correct extension
+	ext = strings.ToUpper(filepath.Ext(filepath.Base(path)))
+	if fastMode && ext != "" {
+		return ext, filepath.Join(*destination, ext), false
 	}
-	return filepath.Join(destination, "_NO_EXTENSION")
+
+	if fastMode && ext == "" {
+		return "UNKNOWN", filepath.Join(*destination, "UNKNOWN"), false
+	}
+
+	b := magicBufs.Get().([]byte)
+	b = b[:0]
+	b = b[:261]
+
+	f, err := os.Open(path)
+	if err != nil {
+		if ext == "" {
+			ext = "UNKNOWN"
+		}
+		return ext, filepath.Join(*destination, ext), false
+	}
+
+	n, rerr := f.Read(b)
+	_ = f.Close()
+	if rerr == nil && n > 0 {
+		kind, kerr := filetype.Match(b)
+		if kerr == nil {
+			if kind != filetype.Unknown {
+				fmt.Printf("File type: %s. MIME: %s\n", kind.Extension, kind.MIME.Value)
+				ext = strings.ToUpper(kind.Extension)
+			}
+		}
+	}
+
+	if ext == "" {
+		ext = "UNKNOWN"
+	}
+
+	dest = filepath.Join(*destination, ext)
+	isImage = filetype.IsImage(b)
+	magicBufs.Put(b)
+	return
 }
 
-func getFileName(fname string, sourcePath, extension string) string {
-	if keepFilename {
-		return fname
+func getFileName(fname string, sourcePath, extension string, isImage bool) string {
+	if keepFilename || fastMode || !isImage || !dateTimeFilename {
+		if filepath.Base(fname) != "" {
+			return filepath.Base(fname) + "." + strings.ToLower(extension)
+		}
 	}
-	if dateTimeFilename {
+
+	fmt.Println("getting filename for: " + sourcePath)
+
+	if dateTimeFilename && !fastMode && !keepFilename && isImage {
 		return getDateTimeFileName(sourcePath, extension, fname)
 	}
 	return strconv.Itoa(int(atomic.LoadInt64(&fileCounter))) + "." + strings.ToLower(extension)
@@ -632,12 +660,12 @@ func getDateTimeFileName(sourcePath, extension, fallbackName string) string {
 	if err == nil {
 		creationTime, err := getMinimumCreationTime(rawExifData)
 		if creationTime != nil && err == nil {
-			creationTimeStr := creationTime.Format("20060102_150405")
+			creationTimeStr := creationTime.Format("2006-01-02_15-04-05")
 			fileName := creationTimeStr + "." + strings.ToLower(extension)
 			index := 0
-			for fileExists(filepath.Join(destination, extension, fileName)) {
+			for fileExists(filepath.Join(*destination, extension, fileName)) {
 				index++
-				fileName = fmt.Sprintf("%s(%d).%s", creationTimeStr, index, strings.ToLower(extension))
+				fileName = fmt.Sprintf("%s-%d.%s", creationTimeStr, index, strings.ToLower(extension))
 			}
 			return fileName
 		}
