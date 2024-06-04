@@ -769,7 +769,7 @@ func getFileName(fname string, sourcePath, extension string, isImage, isWAV bool
 		if strings.Contains(fbase, "_") {
 			fbase = strings.Split(fbase, "_")[0]
 		}
-		fname = fmt.Sprintf("%s_%d.%s", fbase, index, filepath.Ext(fname))
+		fname = fmt.Sprintf("%s_%d%s", fbase, index, filepath.Ext(fname))
 	}
 
 	return fname
