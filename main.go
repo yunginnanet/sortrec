@@ -4,7 +4,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -107,8 +106,6 @@ func getMinimumCreationTime(rawExif []byte) (*time.Time, error) {
 		creationTime *time.Time
 	)
 
-	fmt.Println("Getting minimum creation time")
-
 	im, err := exifcommon.NewIfdMappingWithStandard()
 	if err != nil {
 		_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not create IFD mapping: "+reset+"%v\n", err))
@@ -155,9 +152,6 @@ func getMinimumCreationTime(rawExif []byte) (*time.Time, error) {
 		err = fmt.Errorf("no creation time found")
 	}
 
-	if creationTime != nil {
-		fmt.Println("Minimum creation time: " + creationTime.Format(time.RFC3339))
-	}
 	return creationTime, err
 }
 
@@ -167,8 +161,8 @@ const kilo = 1024 * 1024
 
 func getRawExif(imagePath string) ([]byte, error) {
 	fmt.Println("Getting raw exif for " + imagePath)
-	lockFile(imagePath)
-	defer unlockFile(imagePath)
+	/*	lockFile(imagePath)
+		defer unlockFile(imagePath)*/
 
 	buf := bufs.Get()
 	buf.Reset()
@@ -180,19 +174,8 @@ func getRawExif(imagePath string) ([]byte, error) {
 		// _, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not open file %s: "+reset+"%v\n", imagePath, err))
 		return nil, err
 	}
-	size := kilo
-	fstat, statErr := f.Stat()
-	if statErr == nil && fstat.Size() < int64(kilo) {
-		size = int(fstat.Size() / 2)
-	}
-	lr := io.LimitReader(f, int64(size))
-	buf2 := bufs.Get()
-	buf2.Reset()
-	buf2.Grow(size / 2)
-	var n int64
-	n, err = io.CopyBuffer(buf, lr, buf2.Bytes()[0:buf2.Cap()])
-	f.Close()
-	bufs.Put(buf2)
+
+	n, err := f.Read(buf.Bytes()[:buf.Cap()])
 
 	if err != nil || n == 0 {
 		if err == nil {
@@ -202,7 +185,7 @@ func getRawExif(imagePath string) ([]byte, error) {
 		return nil, err
 	}
 
-	rawExif, err := exif.SearchAndExtractExifWithReader(io.LimitReader(buf, n))
+	rawExif, err := exif.SearchAndExtractExifWithReader(buf)
 	bufs.Put(buf)
 	if len(rawExif) == 0 && err == nil {
 		err = fmt.Errorf("no exif data found")
@@ -230,7 +213,7 @@ func postprocessImage(imagePath string, wg *sync.WaitGroup, imagesChan chan<- Im
 		creationT := fileInfo.ModTime()
 		creationTime = &creationT
 	} else {
-		fmt.Printf("Creation time found for %s: %s", imagePath, creationTime.Format(time.RFC3339))
+		fmt.Printf("Creation time found for %s: %s\n", imagePath, creationTime.Format(time.RFC3339))
 	}
 
 	imagesChan <- Image{creationTime.Unix(), imagePath}
@@ -242,8 +225,6 @@ func createPath(newPath string) {
 	if newPath == "" {
 		return
 	}
-	lockFile(newPath)
-	defer unlockFile(newPath)
 	if _, err := os.Stat(newPath); os.IsNotExist(err) {
 		if err := os.MkdirAll(newPath, 0755); err != nil {
 			panic(fmt.Errorf("%s: %w", newPath, err))
@@ -575,6 +556,7 @@ func main() {
 		}
 		return nil
 	}); err == nil {
+		fmt.Println("Waiting for all files to be processed")
 		wg.Wait()
 	} else {
 		fmt.Println(red + "Error walking the path " + source + ": " + err.Error() + reset)
