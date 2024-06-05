@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -167,7 +168,7 @@ func getRawExif(imagePath string) ([]byte, error) {
 	buf := bufs.Get()
 	buf.Reset()
 	// 64KB
-	buf.Grow(kilo * 64)
+	buf.Grow(kilo * 128)
 
 	f, err := os.Open(imagePath)
 	if err != nil {
@@ -175,7 +176,7 @@ func getRawExif(imagePath string) ([]byte, error) {
 		return nil, err
 	}
 
-	n, err := f.Read(buf.Bytes()[:buf.Cap()])
+	n, err := buf.ReadFrom(io.LimitReader(f, kilo*256))
 
 	if err != nil || n == 0 {
 		if err == nil {
@@ -254,20 +255,17 @@ func writeImages(images []Image, destinationRoot string, minEventDeltaDays int, 
 	var previousTime int64
 	eventNumber := 0
 	var previousDestination string
-	today := time.Now().Format("02/01/2006")
+	nowYear, nowMonth, nowDay := time.Now().Date()
 
 	for _, image := range images {
 		var destination, destinationFilePath string
 		t := time.Unix(image.Time, 0)
-		year := t.Format("2006")
-		var month string
-		if splitByMonth {
-			month = t.Format("01")
-		}
-		creationDate := t.Format("02/01/2006")
+		year := strconv.Itoa(t.Year())
+		var month = t.Month().String()
 		fileName := filepath.Base(image.Path)
 
-		if creationDate == today {
+		thenYear, thenMonth, thenDay := t.Date()
+		if (thenYear == nowYear && thenMonth == nowMonth && thenDay == nowDay) || t.IsZero() {
 			createUnknownDateFolder(destinationRoot)
 			destination = filepath.Join(destinationRoot, unknownDateFolderName)
 			destinationFilePath = filepath.Join(destination, fileName)
@@ -598,7 +596,6 @@ func processFile(paths chan string, wg *sync.WaitGroup) {
 	}*/
 	if !strings.Contains(destinationDirectory, *destination) {
 		panic(fmt.Errorf("destination directory %s is not a subdirectory of %s", destinationDirectory, *destination))
-		os.Exit(1)
 	}
 	// fmt.Println("destination directory: " + destinationDirectory)
 	createPath(destinationDirectory)
@@ -717,17 +714,22 @@ func getFileName(fname string, sourcePath, extension string, isImage, isWAV bool
 		return fname
 	}
 
-	fmt.Println("getting filename for: " + sourcePath)
-
 	if dateTimeFilename && !fastMode && !keepFilename && isImage {
-		fname = getDateTimeFileName(sourcePath, extension, fname)
+		fmt.Println("getting filename for: " + sourcePath)
+		fname2 := getDateTimeFileName(sourcePath, extension, fname)
+		if fname2 != fname {
+			fname = fname2
+			fmt.Println("got filename: " + fname)
+		}
 	}
 
-	if dateTimeFilename && !fastMode && !keepFilename && isWAV && !isImage {
+	if dateTimeFilename && !fastMode && !keepFilename && isWAV {
 		newFilename, err := readWAV(sourcePath)
-		if err == nil {
+		if err == nil && newFilename != fname {
 			fname = newFilename
+			fmt.Println("got filename: " + fname)
 		}
+
 	}
 
 	if !isImage && !isWAV {
@@ -763,6 +765,9 @@ func getDateTimeFileName(sourcePath, extension, fallbackName string) string {
 		creationTime, err := getMinimumCreationTime(rawExifData)
 		if creationTime != nil && err == nil {
 			creationTimeStr := creationTime.Format("2006-01-02_15-04-05")
+			if creationTimeStr == "" {
+				panic("bad time format")
+			}
 			fileName := creationTimeStr + "." + strings.ToLower(extension)
 
 			return fileName
