@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -395,6 +394,12 @@ func fileExists(filename string) bool {
 var errCt int64 = 0
 
 func symLink(src, dst string) {
+
+	if atomic.LoadInt64(&errCt) > 50 {
+		fmt.Println("\n\n" + red + "Too many errors, exiting\n\n" + reset)
+		os.Exit(1)
+	}
+
 	if fileIsBusy(src) || fileIsBusy(dst) {
 		print(".")
 	}
@@ -405,55 +410,49 @@ func symLink(src, dst string) {
 		unlockFile(dst)
 	}()
 
-	if err := os.Symlink(src, dst); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			if err = os.Remove(dst); err != nil {
-				_, _ = os.Stdout.WriteString(fmt.Sprintf("Could not remove existing symlink %s: %v\n", dst, err))
-				atomic.AddInt64(&errCt, 1)
-				return
-			}
-			if err = os.Symlink(src, dst); err == nil {
-				return
-			}
-			_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not create symlink %s"+reset+": %v\n", dst, err))
-		} else if errors.Is(err, os.ErrNotExist) {
-			if strings.Count(src, filepath.Base(src)) > 1 {
-				src = filepath.Dir(src)
-				src = strings.TrimSuffix(src, string(filepath.Separator))
-				if err = os.Symlink(src, dst); err == nil {
-					return
-				}
-				_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not create symlink %s"+reset+": %v\n", dst, err))
-			}
-		} else {
-			_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not create symlink %s"+reset+": %v\n", dst, err))
-		}
+	handleErr := func() {
+		atomic.AddInt64(&errCt, 1)
+		time.Sleep(100 * time.Millisecond)
+	}
 
-		oldErr := err
-		if _, err = os.Stat(filepath.Dir(dst)); err != nil {
-			fmt.Println("Creating directory " + filepath.Dir(dst))
-			if err = os.MkdirAll(filepath.Dir(dst), 0755); err == nil || errors.Is(err, os.ErrExist) {
-				if err = os.Symlink(src, dst); err == nil {
-					return
-				}
+	dstat, err := os.Stat(filepath.Dir(dst))
+	switch {
+	case err == nil && !dstat.IsDir():
+		fmt.Println(red + "destination path (" + filepath.Dir(dst) + ") exists and isn't a directory!" + reset + "\n")
+		handleErr()
+		return
+	case err == nil:
+		break
+	case err != nil && os.IsNotExist(err):
+		if err = os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			if os.IsExist(err) {
+				break
 			}
-		}
-
-		if err = oldErr; err == nil {
+			fmt.Println(red + "failed to create directory!" + reset + "\n")
+			handleErr()
 			return
 		}
+	}
 
-		atomic.AddInt64(&errCt, 1)
-		if atomic.LoadInt64(&errCt) > 50 {
-			fmt.Println("\n\n" + red + "Last error: " + err.Error() + reset)
-			fmt.Println("\n\n" + red + "Too many errors, exiting\n\n" + reset)
-			os.Exit(1)
+	if err = os.Symlink(src, dst); err == nil {
+		return
+	}
+
+	switch {
+	case strings.Contains(err.Error(), ": file exists"):
+		if existingLink, rlerr := os.Readlink(dst); rlerr == nil {
+			if existingLink == src {
+				return
+			}
 		}
+	default:
+		_, _ = os.Stdout.WriteString(fmt.Sprintf(red+"Could not create symlink %s"+reset+": %v\n", dst, err))
+		handleErr()
 	}
 }
 
 func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
-	filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -461,7 +460,7 @@ func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
 			filesInFolder, err := os.ReadDir(path)
 			if err != nil {
 				_, _ = os.Stdout.WriteString(fmt.Sprintf("%sCould not read directory %s%s: %v\n", red, path, err, reset))
-				return nil
+				return err
 			}
 			if len(filesInFolder) > maxNumberOfFilesPerFolder {
 				numberOfSubfolders := (len(filesInFolder)-1)/maxNumberOfFilesPerFolder + 1
@@ -472,17 +471,22 @@ func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
 				fileCounterr := 1
 				for _, file := range filesInFolder {
 					if fileInfo, err := file.Info(); err == nil && fileInfo.Mode().IsRegular() {
-						src := filepath.Join(path, filepath.Base(file.Name()))
+						src := filepath.Join(path, file.Name())
 						dst := strconv.Itoa((fileCounterr-1)/maxNumberOfFilesPerFolder + 1)
-						fmt.Println("Moving " + src + " to " + filepath.Join(path, dst, filepath.Base(src)))
-						os.Rename(src, filepath.Join(path, dst, filepath.Base(src)))
+						fmt.Println("Moving " + src + " to " + filepath.Join(filepath.Base(path), dst, fileInfo.Name()))
+						if err := os.Rename(src, filepath.Join(path, dst, filepath.Base(src))); err != nil {
+							return err
+						}
 						fileCounterr++
 					}
 				}
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		fmt.Println("failed during rename process: " + err.Error())
+		os.Exit(1)
+	}
 }
 
 func main() {
