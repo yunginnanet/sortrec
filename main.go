@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,46 +53,60 @@ const (
 
 func fileIsBusy(path string) bool {
 	busyIndexLock.RLock()
-	flock, ok := fileBusy[path]
-	busyIndexLock.RUnlock()
+	_, ok := fileBusy[path]
 	if !ok {
+		busyIndexLock.RUnlock()
 		return false
 	}
-	return atomic.CompareAndSwapInt64(flock, int64(locked), int64(locked))
+	res := atomic.CompareAndSwapInt64(fileBusy[path], int64(locked), int64(locked))
+	busyIndexLock.RUnlock()
+	return res
 }
 
 func lockFile(path string) {
 	busyIndexLock.RLock()
-	flock, ok := fileBusy[path]
-	busyIndexLock.RUnlock()
+	_, ok := fileBusy[path]
 	if !ok {
+		busyIndexLock.RUnlock()
 		busyIndexLock.Lock()
 		fileBusy[path] = new(int64)
-		flock = fileBusy[path]
-		atomic.StoreInt64(flock, int64(locked))
+		atomic.StoreInt64(fileBusy[path], int64(locked))
 		busyIndexLock.Unlock()
 		return
 	}
+	busyIndexLock.RUnlock()
 	// exponential back off on the spinlocc
 	multiplier := 0
-	for !atomic.CompareAndSwapInt64(flock, int64(unlocked), int64(locked)) {
+	for {
+		busyIndexLock.RLock()
+		if atomic.LoadInt64(fileBusy[path]) == int64(locked) {
+			busyIndexLock.RUnlock()
+			break
+		}
+
+		if atomic.CompareAndSwapInt64(fileBusy[path], int64(unlocked), int64(locked)) {
+			busyIndexLock.RUnlock()
+			break
+		}
+		busyIndexLock.RUnlock()
 		multiplier++
 		target := 100
 		if multiplier > 10 {
 			target = target * multiplier / 10
 		}
+		println("spinlock (" + path + "): sleeping for somewhere between 0 and " + strconv.Itoa(target) + " milliseconds...")
 		entropy.RandSleepMS(target)
 	}
 }
-
 func unlockFile(path string) {
-	busyIndexLock.RLock()
-	flock, ok := fileBusy[path]
-	busyIndexLock.RUnlock()
+	busyIndexLock.Lock()
+	_, ok := fileBusy[path]
 	if !ok {
+		busyIndexLock.Unlock()
 		return
 	}
-	atomic.StoreInt64(flock, int64(unlocked))
+	atomic.StoreInt64(fileBusy[path], int64(unlocked))
+	busyIndexLock.Unlock()
 }
 
 const (
@@ -196,7 +209,7 @@ func getRawExif(imagePath string) ([]byte, error) {
 	return rawExif, err
 }
 
-func postprocessImage(imagePath string, wg *sync.WaitGroup, imagesChan chan<- Image) {
+func postprocessImage(imagePath string, destinationRoot string, wg *sync.WaitGroup, splitByMonth bool) {
 	defer wg.Done()
 
 	rawExif, err := getRawExif(imagePath)
@@ -219,7 +232,7 @@ func postprocessImage(imagePath string, wg *sync.WaitGroup, imagesChan chan<- Im
 		fmt.Printf("Creation time found for %s: %s\n", imagePath, creationTime.Format(time.RFC3339))
 	}
 
-	imagesChan <- Image{creationTime.Unix(), imagePath}
+	writeImage(Image{creationTime.Unix(), imagePath}, destinationRoot)
 }
 
 func createPath(newPath string) {
@@ -235,117 +248,59 @@ func createPath(newPath string) {
 	}
 }
 
-func createNewFolder(destinationRoot, year, month string, eventNumber int) {
-	var newPath string
-	if month != "" {
-		newPath = filepath.Join(destinationRoot, year, month, strconv.Itoa(eventNumber))
-	} else {
-		newPath = filepath.Join(destinationRoot, year, strconv.Itoa(eventNumber))
-	}
-	createPath(newPath)
-}
+func writeImage(image Image, destinationRoot string) {
+	// minEventDelta := int64(minEventDeltaDays * 60 * 60 * 24)
 
-func createUnknownDateFolder(destinationRoot string) {
-	path := filepath.Join(destinationRoot, unknownDateFolderName)
-	createPath(path)
-}
-
-func writeImages(images []Image, destinationRoot string, minEventDeltaDays int, splitByMonth bool) {
-	minEventDelta := int64(minEventDeltaDays * 60 * 60 * 24)
-	sort.Slice(images, func(i, j int) bool { return images[i].Time < images[j].Time })
-
-	var previousTime int64
-	eventNumber := 0
-	var previousDestination string
 	nowYear, nowMonth, nowDay := time.Now().Date()
 
-	for _, image := range images {
-		var destination, destinationFilePath string
-		t := time.Unix(image.Time, 0)
-		year := strconv.Itoa(t.Year())
-		var month = t.Month().String()
-		fileName := filepath.Base(image.Path)
+	t := time.Unix(image.Time, 0)
+	fileName := filepath.Base(image.Path)
 
-		thenYear, thenMonth, thenDay := t.Date()
-		if (thenYear == nowYear && thenMonth == nowMonth && thenDay == nowDay) || t.IsZero() {
-			createUnknownDateFolder(destinationRoot)
-			destination = filepath.Join(destinationRoot, unknownDateFolderName)
-			destinationFilePath = filepath.Join(destination, fileName)
-		} else {
-			if previousTime == 0 || (previousTime+minEventDelta) < image.Time {
-				eventNumber++
-				createNewFolder(destinationRoot, year, month, eventNumber)
-			}
+	destinationDir := ""
+	destinationFilePath := ""
 
-			previousTime = image.Time
-
-			destComponents := []string{destinationRoot, year, month, strconv.Itoa(eventNumber)}
-			validComponents := filterNonEmpty(destComponents)
-			destination = filepath.Join(validComponents...)
-
-			if _, err := os.Stat(destination); os.IsNotExist(err) {
-				destination = previousDestination
-			}
-
-			previousDestination = destination
-			destinationFilePath = filepath.Join(destination, fileName)
-		}
-
-		if !fileExists(destinationFilePath) {
-			lockFile(destinationFilePath)
-			lockFile(image.Path)
-			os.Rename(image.Path, destinationFilePath)
-			unlockFile(image.Path)
-			unlockFile(destinationFilePath)
-		} else {
-			if fileExists(image.Path) {
-				lockFile(image.Path)
-				os.Remove(image.Path)
-				unlockFile(image.Path)
-			}
-		}
+	thenYear, thenMonth, thenDay := t.Date()
+	if (thenYear != nowYear && thenMonth != nowMonth && thenDay != nowDay) && !t.IsZero() {
+		destinationDir = filepath.Join(
+			destinationRoot, strconv.Itoa(thenYear), thenMonth.String(), strconv.Itoa(thenDay),
+		)
+		_ = os.MkdirAll(destinationDir, 0755)
+		destinationFilePath = filepath.Join(destinationFilePath, fileName)
 	}
+
+	if destinationFilePath != "" && !fileExists(destinationFilePath) {
+		os.Rename(image.Path, destinationFilePath)
+	}
+
 }
 
 func postprocessImages(imageDirectory string, minEventDeltaDays int, splitByMonth bool) {
 	var wg = &sync.WaitGroup{}
-	imagesChan := make(chan Image, 50)
 
-	spin := spinner.New(spinner.CharSets[34], 50*time.Millisecond)
+	spin := spinner.New(spinner.CharSets[34], 50*time.Millisecond, spinner.WithColor("blue"))
 
-	fmt.Println("\n\n" + blue + "processing images..." + reset + "\n\n")
+	fmt.Println("\n\n" + blue + "processing images..." + reset)
+	fmt.Print("\n")
 
 	spin.Start()
 
-	err := filepath.Walk(imageDirectory, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(imageDirectory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
 			wg.Add(1)
-			_ = workers.Submit(func() { postprocessImage(path, wg, imagesChan) })
+			_ = workers.Submit(func() { postprocessImage(path, imageDirectory, wg, splitByMonth) })
 		}
 		return nil
-	})
-
-	if err != nil {
+	}); err != nil {
 		_, _ = os.Stdout.WriteString(fmt.Sprintf("Error walking the path %s: %v\n", imageDirectory, err))
 		spin.Stop()
 		return
-	}
-
-	go func() {
+	} else {
 		wg.Wait()
-		close(imagesChan)
-		spin.Stop()
-	}()
-
-	var images []Image
-	for image := range imagesChan {
-		images = append(images, image)
 	}
 
-	writeImages(images, imageDirectory, minEventDeltaDays, splitByMonth)
 }
 
 func getNumberOfFilesInFolderRecursively(startPath string) int {
@@ -378,7 +333,7 @@ func getNumberOfFilesInFolderRecursively(startPath string) int {
 }
 
 func log(logString string) {
-	_, _ = os.Stdout.WriteString(fmt.Sprintf("%s: %s", time.Now().Format("15:04:05\n"), logString))
+	_, _ = os.Stdout.WriteString(fmt.Sprintf("\n\n%s: %s", time.Now().Format("15:04:05\n\n"), logString))
 }
 
 func filterNonEmpty(strings []string) []string {
@@ -401,13 +356,27 @@ var errCt int64 = 0
 func symLink(src, dst string) {
 
 	if atomic.LoadInt64(&errCt) > 50 {
-		fmt.Println("\n\n" + red + "Too many errors, exiting\n\n" + reset)
+		fmt.Println("\n\n" + red + "Too many errors, exiting" + reset)
+		fmt.Print("\n\n")
 		os.Exit(1)
 	}
 
-	if fileIsBusy(src) || fileIsBusy(dst) {
-		print(".")
+	race := false
+
+	if fileIsBusy(src) {
+		println("race (src): " + src)
+		race = true
 	}
+
+	if fileIsBusy(dst) {
+		println("race (dst): " + src)
+		race = true
+	}
+
+	if race {
+		return
+	}
+
 	lockFile(dst)
 	lockFile(src)
 	defer func() {
@@ -433,7 +402,7 @@ func symLink(src, dst string) {
 			if os.IsExist(err) {
 				break
 			}
-			fmt.Println(red + "failed to create directory!" + reset + "\n")
+			fmt.Println(red + "failed to create directory!" + reset)
 			handleErr()
 			return
 		}
@@ -560,16 +529,18 @@ func main() {
 		}
 		return nil
 	}); err == nil {
-		fmt.Println("Waiting for all files to be processed")
+		fmt.Println("\n\n" + blue + "Waiting for all files to be processed" + reset)
+		fmt.Print("\n")
 		wg.Wait()
 	} else {
 		fmt.Println(red + "Error walking the path " + source + ": " + err.Error() + reset)
+		os.Exit(1)
 	}
 
 	spin.Stop()
 
 	log("start special file treatment")
-	postprocessImages(filepath.Join(*destination, "JPG"), minEventDeltaDays, splitMonths)
+	postprocessImages(filepath.Join(*destination, "Processed_Images"), minEventDeltaDays, splitMonths)
 
 	log("assure max file per folder number")
 	limitFilesPerFolder(*destination, maxNumberOfFilesPerFolder)
