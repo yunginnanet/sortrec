@@ -4,8 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 
 	"git.tcp.direct/kayos/common/entropy"
 	"git.tcp.direct/kayos/common/pool"
+	"git.tcp.direct/kayos/common/squish"
 	"github.com/briandowns/spinner"
 	"github.com/dsoprea/go-exif/v3"
 	exifcommon "github.com/dsoprea/go-exif/v3/common"
@@ -22,7 +25,14 @@ import (
 	"github.com/panjf2000/ants/v2"
 )
 
-var workers, _ = ants.NewMultiPool(5, 25, ants.RoundRobin)
+func printArt(s string) {
+	up, _ := squish.UnpackStr(s)
+	_, _ = os.Stdout.WriteString(up)
+	time.Sleep(5 * time.Millisecond)
+}
+
+// ineff assignment, flags assign the worker counts
+var workers, _ = ants.NewMultiPool(runtime.NumCPU(), 5, ants.RoundRobin)
 
 const unknownDateFolderName = "date-unknown"
 
@@ -435,19 +445,30 @@ func symLink(src, dst string) {
 	}
 }
 
-func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
+func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) *sync.WaitGroup {
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	defer wg.Done()
 	if err := filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
 		if strings.Contains(path, "Processed_Images") {
 			return nil
 		}
-		if info.IsDir() {
+		if !info.IsDir() {
+			return nil
+		}
+		wg.Add(1)
+		workers.Submit(func() {
+			defer wg.Done()
 			filesInFolder, err := os.ReadDir(path)
 			if err != nil {
 				_, _ = os.Stdout.WriteString(fmt.Sprintf("%sCould not read directory %s%s: %v\n", red, path, err, reset))
-				return err
+				return
 			}
 			adjustedFilesInFolder := []os.DirEntry{}
 			for _, de := range filesInFolder {
@@ -458,7 +479,7 @@ func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
 			}
 			filesInFolder = adjustedFilesInFolder
 			if len(filesInFolder) <= maxNumberOfFilesPerFolder {
-				return nil
+				return
 			}
 			totalLen := len(filesInFolder)
 			folderTarget := totalLen / maxNumberOfFilesPerFolder
@@ -466,14 +487,14 @@ func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
 				if i > 1 && len(filesInFolder) >= totalLen {
 					panic("files in folder not modified after renames")
 				}
+				if len(filesInFolder) <= maxNumberOfFilesPerFolder {
+					break
+				}
 				newPath := filepath.Join(path, strconv.Itoa(i))
 				println("creating directory " + newPath)
 				if err := os.MkdirAll(newPath, 0755); err != nil {
 					println(red + err.Error() + reset)
-					return err
-				}
-				if len(filesInFolder) < maxNumberOfFilesPerFolder {
-					break
+					return
 				}
 				toMove := len(filesInFolder) / maxNumberOfFilesPerFolder
 				for i := 0; i < toMove; i++ {
@@ -481,26 +502,31 @@ func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
 					newhome := filepath.Join(newPath, filesInFolder[i].Name())
 					println("moving " + target + " to " + newhome)
 					if err := os.Rename(target, newhome); err != nil {
-						return err
+						if os.IsNotExist(err) {
+							continue
+						}
+						return
 					}
 				}
 				filesInFolder = filesInFolder[toMove+1:]
 			}
-
-		}
+		})
 		return nil
 	}); err != nil {
 		if !os.IsNotExist(err) {
-			fmt.Println("failed during rename process: " + err.Error())
+			fmt.Println(red + "failed during rename process: " + err.Error() + reset)
 			os.Exit(1)
 		}
 	}
+	return wg
 }
 
 func main() {
 	var (
 		workersFlag int
 		poolsFlag   int
+		helpFlag    bool
+		skipDone    bool
 	)
 
 	flag.StringVar(&source, "src", "", "Source directory with files recovered by Photorec")
@@ -510,24 +536,55 @@ func main() {
 	flag.BoolVar(&keepFilename, "keep_filename", false, "Keeps the original filenames when copying")
 	flag.IntVar(&minEventDeltaDays, "min-event-delta", 4, "Minimum delta in days between two events")
 	flag.BoolVar(&dateTimeFilename, "date_time_filename", false, "Sets the filename to the exif date and time if possible")
+	flag.BoolVar(&skipDone, "update", true, "Skips any files from source that have symlinks in the destination folder already")
 	flag.IntVar(&workersFlag, "workers", 5, "Number of workers to use")
-	flag.IntVar(&poolsFlag, "pools", 25, "Number of pools to use")
+	flag.IntVar(&poolsFlag, "pools", runtime.NumCPU(), "Number of pools to use")
+
+	flag.Usage = func() {
+		printArt("H4sIAAAAAAACA12OuxHAMAhDe0/BqB7ARSoducQeTpMEDFxyodETf5EM4pA3GrGITmgBiLPgNpCPXz+w6VmpYY3DZV/IlOkVO7zs/T3sDNH9UFIt0yy3ByyvR6i0AAAA")
+		flag.PrintDefaults()
+		exNo := 1
+		if helpFlag {
+			exNo = 0
+		}
+		os.Exit(exNo)
+	}
 
 	flag.Parse()
 
-	if workersFlag > 0 && poolsFlag > 0 {
-		workers, _ = ants.NewMultiPool(workersFlag, poolsFlag, ants.RoundRobin)
-
-	}
-
 	if source == "" || *destination == "" {
 		flag.Usage()
-		os.Exit(1)
+	}
+
+	if workersFlag > 0 && poolsFlag > 0 {
+		workers, _ = ants.NewMultiPool(workersFlag, poolsFlag, ants.RoundRobin)
 	}
 
 	if maxNumberOfFilesPerFolder == 0 {
 		fmt.Println("max-per-dir must be greater than 0, setting it to 500 but flags might be fucked")
 		maxNumberOfFilesPerFolder = 500
+	}
+
+	var done = make(map[string]struct{})
+	doneCount := 0
+
+	if skipDone {
+		_ = filepath.Walk(*destination, func(path string, info os.FileInfo, err error) error {
+			if info.IsDir() {
+				return nil
+			}
+			if info.Mode()&fs.ModeType != fs.ModeSymlink {
+				return nil
+			}
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return nil
+			}
+			done[linkTarget] = struct{}{}
+			doneCount++
+			return nil
+		})
+		println("found " + strconv.Itoa(doneCount) + " symlinks already present")
 	}
 
 	fmt.Printf("Reading from source '%s', writing to destination '%s' (max %d files per directory, splitting by year %v).\n",
@@ -552,6 +609,11 @@ func main() {
 	spin.Start()
 
 	if err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+		if skipDone {
+			if _, ok := done[path]; ok {
+				return nil
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -569,15 +631,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	spin.Stop()
-
 	log("start special file treatment")
 	processPath := filepath.Join(*destination, "Processed_Images")
 	_ = os.MkdirAll(processPath, 0755)
 	postprocessImages(filepath.Join(*destination, "JPG"), processPath, minEventDeltaDays, splitMonths)
 
 	log("assure max file per folder number")
-	limitFilesPerFolder(*destination, maxNumberOfFilesPerFolder)
+	wg = limitFilesPerFolder(*destination, maxNumberOfFilesPerFolder)
+
+	wg.Wait()
+
+	spin.Stop()
+
+	printArt("H4sIAAAAAAACAzWLuw2AQAxD+5vCo1JQUlC9OwlYzpPgBBH5E8WOmWYzmKmeYU7J7OH1ZX28s6sycxRdn/zt1Fagtic6XoQWnC9aAAAA")
 }
 
 var magicBufs = sync.Pool{
