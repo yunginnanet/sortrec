@@ -39,7 +39,6 @@ var (
 	keepFilename              bool
 	dateTimeFilename          bool
 	minEventDeltaDays         int
-	fileCounter               int64
 	fileBusy                  = make(map[string]*int64)
 	busyIndexLock             sync.RWMutex
 )
@@ -221,16 +220,16 @@ func postprocessImage(imagePath string, destinationRoot string, wg *sync.WaitGro
 
 	creationTime, err := getMinimumCreationTime(rawExif)
 	if creationTime == nil || err != nil {
-		fileInfo, err := os.Stat(imagePath)
-		if err != nil {
-			_, _ = os.Stdout.WriteString(fmt.Sprintf("Could not get file info for %s: %v\n", imagePath, err))
-			return
-		}
-		creationT := fileInfo.ModTime()
-		creationTime = &creationT
-	} else {
-		fmt.Printf("Creation time found for %s: %s\n", imagePath, creationTime.Format(time.RFC3339))
+		//		fileInfo, err := os.Stat(imagePath)
+		//		if err != nil {
+		_, _ = os.Stdout.WriteString(fmt.Sprintf("Could not get file info for %s: %v\n", imagePath, err))
+		return
+		//		}
+		//		creationT := fileInfo.ModTime()
+		//		creationTime = &creationT
 	}
+
+	fmt.Printf("Creation time found for %s: %s\n", imagePath, creationTime.Format(time.RFC3339))
 
 	writeImage(Image{Time: creationTime.Unix(), Path: imagePath}, destinationRoot)
 }
@@ -441,36 +440,60 @@ func limitFilesPerFolder(folder string, maxNumberOfFilesPerFolder int) {
 		if err != nil {
 			return err
 		}
+		if strings.Contains(path, "Processed_Images") {
+			return nil
+		}
 		if info.IsDir() {
 			filesInFolder, err := os.ReadDir(path)
 			if err != nil {
 				_, _ = os.Stdout.WriteString(fmt.Sprintf("%sCould not read directory %s%s: %v\n", red, path, err, reset))
 				return err
 			}
-			if len(filesInFolder) > maxNumberOfFilesPerFolder {
-				numberOfSubfolders := (len(filesInFolder)-1)/maxNumberOfFilesPerFolder + 1
-				for subFolderNumber := 1; subFolderNumber <= numberOfSubfolders; subFolderNumber++ {
-					subFolderPath := filepath.Join(path, strconv.Itoa(subFolderNumber))
-					createPath(subFolderPath)
+			adjustedFilesInFolder := []os.DirEntry{}
+			for _, de := range filesInFolder {
+				if de.IsDir() {
+					continue
 				}
-				fileCounterr := 1
-				for _, file := range filesInFolder {
-					if fileInfo, err := file.Info(); err == nil && fileInfo.Mode().IsRegular() {
-						src := filepath.Join(path, file.Name())
-						dst := strconv.Itoa((fileCounterr-1)/maxNumberOfFilesPerFolder + 1)
-						fmt.Println("Moving " + src + " to " + filepath.Join(filepath.Base(path), dst, fileInfo.Name()))
-						if err := os.Rename(src, filepath.Join(path, dst, filepath.Base(src))); err != nil {
-							return err
-						}
-						fileCounterr++
+				adjustedFilesInFolder = append(adjustedFilesInFolder, de)
+			}
+			filesInFolder = adjustedFilesInFolder
+			if len(filesInFolder) <= maxNumberOfFilesPerFolder {
+				return nil
+			}
+			totalLen := len(filesInFolder)
+			folderTarget := totalLen / maxNumberOfFilesPerFolder
+			for i := 1; i < folderTarget; i++ {
+				if i > 1 && len(filesInFolder) >= totalLen {
+					panic("files in folder not modified after renames")
+				}
+				newPath := filepath.Join(path, strconv.Itoa(i))
+				println("creating directory " + newPath)
+				if err := os.MkdirAll(newPath, 0755); err != nil {
+					println(red + err.Error() + reset)
+					return err
+				}
+				if len(filesInFolder) < maxNumberOfFilesPerFolder {
+					break
+				}
+				toMove := len(filesInFolder) / maxNumberOfFilesPerFolder
+				for i := 0; i < toMove; i++ {
+					target := filepath.Join(path, filesInFolder[i].Name())
+					newhome := filepath.Join(newPath, filesInFolder[i].Name())
+					println("moving " + target + " to " + newhome)
+					if err := os.Rename(target, newhome); err != nil {
+						return err
 					}
 				}
+				filesInFolder = filesInFolder[toMove+1:]
 			}
+
 		}
 		return nil
 	}); err != nil {
-		fmt.Println("failed during rename process: " + err.Error())
-		os.Exit(1)
+		if !os.IsNotExist(err) {
+			fmt.Println("failed during rename process: " + err.Error())
+			os.Exit(1)
+		}
 	}
 }
 
@@ -523,8 +546,6 @@ func main() {
 		fmt.Println("Files to copy: " + totalAmountToCopy)*/
 
 	var wg = &sync.WaitGroup{}
-
-	atomic.StoreInt64(&fileCounter, 0)
 
 	spin := spinner.New(spinner.CharSets[43], time.Duration(50)*time.Millisecond)
 
