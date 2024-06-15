@@ -232,7 +232,7 @@ func postprocessImage(imagePath string, destinationRoot string, wg *sync.WaitGro
 		fmt.Printf("Creation time found for %s: %s\n", imagePath, creationTime.Format(time.RFC3339))
 	}
 
-	writeImage(Image{creationTime.Unix(), imagePath}, destinationRoot)
+	writeImage(Image{Time: creationTime.Unix(), Path: imagePath}, destinationRoot)
 }
 
 func createPath(newPath string) {
@@ -251,30 +251,41 @@ func createPath(newPath string) {
 func writeImage(image Image, destinationRoot string) {
 	// minEventDelta := int64(minEventDeltaDays * 60 * 60 * 24)
 
-	nowYear, nowMonth, nowDay := time.Now().Date()
-
 	t := time.Unix(image.Time, 0)
 	fileName := filepath.Base(image.Path)
+	if t.IsZero() {
+		println("skipping zero time for " + fileName)
+		return
+	}
 
 	destinationDir := ""
 	destinationFilePath := ""
 
 	thenYear, thenMonth, thenDay := t.Date()
-	if (thenYear != nowYear && thenMonth != nowMonth && thenDay != nowDay) && !t.IsZero() {
-		destinationDir = filepath.Join(
-			destinationRoot, strconv.Itoa(thenYear), thenMonth.String(), strconv.Itoa(thenDay),
-		)
-		_ = os.MkdirAll(destinationDir, 0755)
-		destinationFilePath = filepath.Join(destinationFilePath, fileName)
+	nowYear, nowMonth, nowDay := time.Now().Date()
+
+	if thenYear == nowYear && thenMonth == nowMonth && thenDay == nowDay {
+		println("skipping date the same as today for " + fileName)
+		return
 	}
 
-	if destinationFilePath != "" && !fileExists(destinationFilePath) {
-		os.Rename(image.Path, destinationFilePath)
+	destinationDir = filepath.Join(
+		destinationRoot, strconv.Itoa(thenYear), thenMonth.String(), strconv.Itoa(thenDay),
+	)
+	_ = os.MkdirAll(destinationDir, 0755)
+
+	destinationFilePath = filepath.Join(destinationDir, fileName)
+
+	if destinationFilePath == "" {
+		return
 	}
+
+	println("moving " + image.Path + " to " + destinationFilePath)
+	os.Rename(image.Path, destinationFilePath)
 
 }
 
-func postprocessImages(imageDirectory string, minEventDeltaDays int, splitByMonth bool) {
+func postprocessImages(imageDirectory string, destinationDirectory string, minEventDeltaDays int, splitByMonth bool) {
 	var wg = &sync.WaitGroup{}
 
 	spin := spinner.New(spinner.CharSets[34], 50*time.Millisecond, spinner.WithColor("blue"))
@@ -290,7 +301,7 @@ func postprocessImages(imageDirectory string, minEventDeltaDays int, splitByMont
 		}
 		if !info.IsDir() {
 			wg.Add(1)
-			_ = workers.Submit(func() { postprocessImage(path, imageDirectory, wg, splitByMonth) })
+			_ = workers.Submit(func() { postprocessImage(path, destinationDirectory, wg, splitByMonth) })
 		}
 		return nil
 	}); err != nil {
@@ -540,7 +551,9 @@ func main() {
 	spin.Stop()
 
 	log("start special file treatment")
-	postprocessImages(filepath.Join(*destination, "Processed_Images"), minEventDeltaDays, splitMonths)
+	processPath := filepath.Join(*destination, "Processed_Images")
+	_ = os.MkdirAll(processPath, 0755)
+	postprocessImages(filepath.Join(*destination, "JPG"), processPath, minEventDeltaDays, splitMonths)
 
 	log("assure max file per folder number")
 	limitFilesPerFolder(*destination, maxNumberOfFilesPerFolder)
