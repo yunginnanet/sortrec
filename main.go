@@ -97,8 +97,11 @@ func unlockFile(path string) {
 }
 
 const (
-	red   = "\033[31m"
-	reset = "\033[0m"
+	colPre = "\033["
+	colSuf = "m"
+	red    = colPre + "31" + colSuf
+	blue   = colPre + "36" + colSuf
+	reset  = colPre + "0" + colSuf
 )
 
 func getMinimumCreationTime(rawExif []byte) (*time.Time, error) {
@@ -309,6 +312,8 @@ func postprocessImages(imageDirectory string, minEventDeltaDays int, splitByMont
 	imagesChan := make(chan Image, 50)
 
 	spin := spinner.New(spinner.CharSets[34], 50*time.Millisecond)
+
+	fmt.Println("\n\n" + blue + "processing images..." + reset + "\n\n")
 
 	spin.Start()
 
@@ -545,16 +550,13 @@ func main() {
 
 	spin.Start()
 
-	paths := make(chan string, poolsFlag*workersFlag)
-
 	if err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
 			wg.Add(1)
-			paths <- path
-			_ = workers.Submit(func() { processFile(paths, wg) })
+			_ = workers.Submit(func() { processFile(path, wg) })
 		}
 		return nil
 	}); err == nil {
@@ -579,17 +581,8 @@ var magicBufs = sync.Pool{
 	},
 }
 
-func processFile(paths chan string, wg *sync.WaitGroup) {
+func processFile(path string, wg *sync.WaitGroup) {
 	defer wg.Done()
-	var path string
-	select {
-	case path = <-paths:
-		if path == "" {
-			return
-		}
-	default:
-		return
-	}
 	fmt.Println("processing: " + path)
 
 	// fmt.Println("extension for: " + path + " is " + extension)
