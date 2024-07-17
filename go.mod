@@ -3,12 +3,14 @@ module sortrec
 go 1.22.3
 
 require (
-	git.tcp.direct/kayos/common v0.9.7
+	git.tcp.direct/kayos/common v0.9.9
 	github.com/briandowns/spinner v1.23.0
+	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/dsoprea/go-exif/v3 v3.0.1
 	github.com/go-audio/wav v1.1.0
 	github.com/h2non/filetype v1.1.3
 	github.com/panjf2000/ants/v2 v2.9.1
+	golang.org/x/text v0.16.0
 )
 
 require (
@@ -21,9 +23,10 @@ require (
 	github.com/golang/geo v0.0.0-20210211234256-740aa86cb551 // indirect
 	github.com/mattn/go-colorable v0.1.2 // indirect
 	github.com/mattn/go-isatty v0.0.8 // indirect
-	golang.org/x/net v0.0.0-20221002022538-bcab6841153b // indirect
-	golang.org/x/sys v0.16.0 // indirect
-	golang.org/x/term v0.1.0 // indirect
+	golang.org/x/crypto v0.24.0 // indirect
+	golang.org/x/net v0.21.0 // indirect
+	golang.org/x/sys v0.21.0 // indirect
+	golang.org/x/term v0.21.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	nullprogram.com/x/rng v1.1.0 // indirect
 )
